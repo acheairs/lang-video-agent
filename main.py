@@ -24,6 +24,10 @@ import os
 import imageio_ffmpeg
 from pathlib import Path
 
+PROJECT_DIR = Path(__file__).resolve().parent
+LOCAL_BIN = PROJECT_DIR / "bin"
+os.environ["PATH"] = str(LOCAL_BIN) + os.pathsep + os.environ.get("PATH", "")
+
 ffmpeg_bin = Path(imageio_ffmpeg.get_ffmpeg_exe()).parent
 
 os.environ["PATH"] = (
@@ -452,6 +456,73 @@ def main() -> None:
     print(f"Report saved to {args.report}")
     print(f"Transcript entries: {transcript_count}")
     print(f"Manual-review entries: {manual_count}")
+
+
+    google_doc_link = upload_docx_to_google_drive(
+        args.output,
+        "Completed AP Lang FRQ Video Notes",
+    )
+
+    if google_doc_link:
+        print(f"Google Doc created: {google_doc_link}")
+
+
+def upload_docx_to_google_drive(docx_path: str, google_doc_name: str) -> Optional[str]:
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+
+    scopes = ["https://www.googleapis.com/auth/drive.file"]
+    creds = None
+
+    token_path = Path("token.json")
+    credentials_path = Path("credentials.json")
+
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not credentials_path.exists():
+                print("Google upload skipped: credentials.json not found.")
+                return None
+
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(credentials_path),
+                scopes,
+            )
+            creds = flow.run_local_server(port=0)
+
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+
+    service = build("drive", "v3", credentials=creds)
+
+    file_metadata = {
+        "name": google_doc_name,
+        "mimeType": "application/vnd.google-apps.document",
+    }
+
+    media = MediaFileUpload(
+        docx_path,
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        resumable=True,
+    )
+
+    uploaded = (
+        service.files()
+        .create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, webViewLink",
+        )
+        .execute()
+    )
+
+    return uploaded.get("webViewLink")
 
 
 if __name__ == "__main__":

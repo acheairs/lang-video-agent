@@ -12,3 +12,5 @@ video_processing_report.json
 *.mp3
 *.webm
 *.wav
+credentials.json
+token.json
