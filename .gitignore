@@ -1,0 +1,14 @@
+venv/
+.env
+audio/
+__pycache__/
+*.pyc
+
+completed_all_ap_lang_frq_video_notes.docx
+video_processing_report.json
+
+.DS_Store
+
+*.mp3
+*.webm
+*.wav

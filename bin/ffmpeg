@@ -1,0 +1,2 @@
+#!/bin/bash
+"/Users/adam/ap-lang-video-agent/venv/lib/python3.12/site-packages/imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v7.1" "$@"

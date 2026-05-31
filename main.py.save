@@ -1,0 +1,361 @@
+"""
+AP Lang FRQ All-Videos Worksheet Agent
+
+What this does:
+- Reads the assignment PDF and extracts every listed AP Lang review video title.
+- Finds the matching YouTube video for each title.
+- Pulls YouTube transcripts when available.
+- Generates one completed worksheet page per video.
+- Exports a .docx file you can upload to Google Drive or open in Google Docs.
+
+Install locally:
+    pip install -r requirements.txt
+
+Run locally:
+    python main.py \
+      --assignment "AP FRQ Videos & Choose Your Own Adventure Review Assignment (Collyer) - Google Docs.pdf" \
+      --output "completed_all_ap_lang_frq_video_notes.docx"
+
+Optional:
+    Add OPENAI_API_KEY to a .env file for automatic note writing.
+    Without an API key, the agent still finds videos and creates manual-review pages.
+
+Important:
+- This agent does not pretend to watch videos if transcripts are unavailable.
+- If a transcript is missing, it creates a clearly marked manual-review entry.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import yt_dlp
+from docx import Document
+from dotenv import load_dotenv
+from pypdf import PdfReader
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+
+VIDEO_SECTION_HEADERS = {
+    "Synthesis (Q1)": "Synthesis",
+    "Rhetorical Analysis (Q2)": "Rhetorical Analysis",
+    "Argument (Q3)": "Argument",
+    "General Tips on Commentary": "Commentary",
+    "Sophistication": "Sophistication",
+}
+
+
+@dataclass
+class VideoResult:
+    title: str
+    category: str
+    url: Optional[str] = None
+    video_id: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    transcript: Optional[str] = None
+    transcript_available: bool = False
+    notes: Optional[Dict[str, object]] = None
+    error: Optional[str] = None
+    manual_review: bool = False
+
+
+def read_pdf_text(pdf_path: str | Path) -> str:
+    reader = PdfReader(str(pdf_path))
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return "\n".join(pages)
+
+
+def extract_video_titles(assignment_text: str) -> List[VideoResult]:
+    """Extract every bullet-pointed video title from the assignment PDF."""
+    lines = [line.strip() for line in assignment_text.splitlines() if line.strip()]
+    current_category = "Priority"
+    videos: List[VideoResult] = []
+
+    for line in lines:
+        clean = re.sub(r"^●\s*", "", line).strip()
+
+        for header, category in VIDEO_SECTION_HEADERS.items():
+            if header.lower() in clean.lower():
+                current_category = category
+
+        if line.startswith("●"):
+            title = clean
+            # Skip broad mini-headings that appear as bullets in the priority section.
+            if title.lower() in {"rhetorical analysis", "synthesis", "argument"}:
+                continue
+            videos.append(VideoResult(title=title, category=current_category))
+
+    # Dedupe while preserving order.
+    seen = set()
+    unique: List[VideoResult] = []
+    for video in videos:
+        key = video.title.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(video)
+
+    return unique
+
+
+def search_youtube(title: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
+    """Return URL, video ID, duration in seconds, and error if any."""
+    options = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": False,
+        "default_search": "ytsearch1",
+        "noplaylist": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{title}", download=False)
+            entries = info.get("entries") or []
+            if not entries:
+                return None, None, None, "No YouTube result found."
+            video = entries[0]
+            return video.get("webpage_url"), video.get("id"), video.get("duration"), None
+    except Exception as exc:
+        return None, None, None, str(exc)
+
+
+def fetch_transcript(video_id: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        transcript_items = YouTubeTranscriptApi.get_transcript(video_id)
+        transcript = " ".join(item.get("text", "") for item in transcript_items)
+        transcript = re.sub(r"\s+", " ", transcript).strip()
+        return transcript, None
+    except (TranscriptsDisabled, NoTranscriptFound) as exc:
+        return None, f"Transcript unavailable: {exc}"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def duration_label(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "Unknown"
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def fallback_notes(video: VideoResult) -> Dict[str, object]:
+    return {
+        "before_video": (
+            f"I chose this video because the title, \"{video.title},\" points to a skill that matters for the AP Lang FRQ section. "
+            "I want to understand the process well enough to use it under timed conditions instead of relying on a vague memory of what a strong essay is supposed to sound like."
+        ),
+        "lesson_overview": (
+            "Manual review needed. A usable transcript was not available, so this entry should be completed after watching the video directly. "
+            "To make this acceptable for the assignment, add the speaker’s main advice, one concrete example or phrase from the video, and a clear explanation of how that advice applies to an AP Lang FRQ response."
+        ),
+        "learned": [
+            "Manual review needed: add one concrete strategy from the video.",
+            "Manual review needed: add one specific example, phrase, acronym, or distinction from the speaker.",
+            "Manual review needed: add one mistake the video warns students to avoid.",
+        ],
+        "already_knew": [
+            "I already knew that AP Lang FRQs need a defensible thesis rather than a broad topic sentence.",
+            "I already knew that evidence has to be explained, not just dropped into the paragraph.",
+        ],
+        "exam_day": "Use the video’s actual advice, not a generic rule, when revising this entry before submission.",
+    }
+
+
+def generate_notes_with_openai(video: VideoResult, client: OpenAI, model: str) -> Dict[str, object]:
+    transcript_excerpt = (video.transcript or "")[:16000]
+
+    prompt = f"""
+You are completing an AP English Language FRQ review worksheet for a student.
+
+Video title: {video.title}
+Video category: {video.category}
+Video length: {duration_label(video.duration_seconds)}
+Transcript excerpt:
+{transcript_excerpt}
+
+Return valid JSON only, with this exact shape:
+{{
+  "before_video": "2 to 3 complete sentences. Explain what skill the student hopes to understand before watching, based on the title.",
+  "lesson_overview": "One full paragraph in complete sentences. It must include concrete proof from the transcript: examples, steps, phrases, distinctions, or advice the speaker gave.",
+  "learned": ["specific learned item 1", "specific learned item 2", "specific learned item 3"],
+  "already_knew": ["plausible thing the student already knew 1", "plausible thing the student already knew 2"],
+  "exam_day": "one practical sentence about what to remember on exam day"
+}}
+
+Rules:
+- Do not invent details that are not in the transcript.
+- Be specific enough to prove the video was watched.
+- Write in a natural, thoughtful high school student voice.
+- Avoid vague filler such as "I learned to use evidence better" unless you explain the exact move.
+""".strip()
+
+    response = client.responses.create(
+        model=model,
+        input=prompt,
+        temperature=0.35,
+    )
+
+    raw = response.output_text.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def process_all_videos(videos: List[VideoResult], model_name: str) -> List[VideoResult]:
+    load_dotenv()
+    client = None
+    if OpenAI and os.getenv("OPENAI_API_KEY"):
+        client = OpenAI()
+
+    for index, video in enumerate(videos, start=1):
+        print(f"[{index}/{len(videos)}] Processing: {video.title}")
+
+        url, video_id, duration, search_error = search_youtube(video.title)
+        video.url = url
+        video.video_id = video_id
+        video.duration_seconds = duration
+
+        if search_error:
+            video.error = search_error
+            video.manual_review = True
+            video.notes = fallback_notes(video)
+            continue
+
+        if video.video_id:
+            transcript, transcript_error = fetch_transcript(video.video_id)
+            video.transcript = transcript
+            video.transcript_available = transcript is not None
+            if transcript_error:
+                video.error = transcript_error
+                video.manual_review = True
+
+        if client and video.transcript_available:
+            try:
+                video.notes = generate_notes_with_openai(video, client, model_name)
+            except Exception as exc:
+                video.error = f"OpenAI note generation failed: {exc}"
+                video.manual_review = True
+                video.notes = fallback_notes(video)
+        else:
+            video.notes = fallback_notes(video)
+            if not client:
+                video.error = "No OPENAI_API_KEY found. Created manual-review worksheet page."
+                video.manual_review = True
+
+    return videos
+
+
+def add_labeled_paragraph(doc: Document, label: str, body: str) -> None:
+    p = doc.add_paragraph()
+    p.add_run(label).bold = True
+    p.add_run(body)
+
+
+def export_docx(videos: List[VideoResult], output_path: str | Path) -> None:
+    doc = Document()
+    doc.add_heading("Choose Your Own Adventure FRQ Exam Review Notes", level=1)
+    doc.add_paragraph("All listed videos processed. Each video has its own worksheet page.")
+
+    for number, video in enumerate(videos, start=1):
+        if number > 1:
+            doc.add_page_break()
+
+        notes = video.notes or fallback_notes(video)
+
+        doc.add_heading(f"Video {number}: {video.title}", level=2)
+        add_labeled_paragraph(doc, "Category: ", video.category)
+        add_labeled_paragraph(doc, "Video Link: ", video.url or "Manual link needed")
+        add_labeled_paragraph(doc, "Video Length: ", duration_label(video.duration_seconds))
+
+        add_labeled_paragraph(
+            doc,
+            "BEFORE THE VIDEO: Based on the video description, what skill are you hoping this video will help you better understand?\n",
+            str(notes.get("before_video", "")),
+        )
+
+        add_labeled_paragraph(
+            doc,
+            "Lesson Overview:\n",
+            str(notes.get("lesson_overview", "")),
+        )
+
+        doc.add_paragraph("3 Things I Learned").runs[0].bold = True
+        for i, item in enumerate(notes.get("learned", [])[:3], start=1):
+            doc.add_paragraph(f"{i}. {item}")
+
+        doc.add_paragraph("2 Things I Already Knew").runs[0].bold = True
+        for i, item in enumerate(notes.get("already_knew", [])[:2], start=1):
+            doc.add_paragraph(f"{i}. {item}")
+
+        add_labeled_paragraph(
+            doc,
+            "1 Thing I Want to Remember on Exam Day Related to the Video:\n",
+            str(notes.get("exam_day", "")),
+        )
+
+        if video.manual_review:
+            add_labeled_paragraph(doc, "Manual Review Flag: ", video.error or "Needs manual review.")
+
+    doc.save(str(output_path))
+
+
+def export_report(videos: List[VideoResult], report_path: str | Path) -> None:
+    rows = []
+    for video in videos:
+        rows.append(
+            {
+                "title": video.title,
+                "category": video.category,
+                "url": video.url,
+                "duration": duration_label(video.duration_seconds),
+                "transcript_available": video.transcript_available,
+                "manual_review": video.manual_review,
+                "error": video.error,
+            }
+        )
+    Path(report_path).write_text(json.dumps(rows, indent=2), encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AP Lang all-videos worksheet agent")
+    parser.add_argument("--assignment", required=True, help="Path to assignment PDF")
+    parser.add_argument("--output", default="completed_all_ap_lang_frq_video_notes.docx")
+    parser.add_argument("--report", default="video_processing_report.json")
+    parser.add_argument("--model", default="gpt-4.1-mini", help="OpenAI model for note generation")
+    args = parser.parse_args()
+
+    assignment_text = read_pdf_text(args.assignment)
+    videos = extract_video_titles(assignment_text)
+
+    if not videos:
+        raise RuntimeError("No video titles found in the assignment PDF.")
+
+    print(f"Found {len(videos)} unique videos.")
+    processed = process_all_videos(videos, args.model)
+    export_docx(processed, args.output)
+    export_report(processed, args.report)
+
+    manual_count = sum(1 for video in processed if video.manual_review)
+    print(f"Done. Wrote {args.output}")
+    print(f"Report saved to {args.report}")
+    print(f"Manual-review entries: {manual_count}")
+
+
+if __name__ == "__main__":
+    main

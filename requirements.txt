@@ -1,0 +1,8 @@
+openai
+python-docx
+python-dotenv
+yt-dlp
+youtube-transcript-api
+pypdf
+imageio-ffmpeg
+openai-whisper
