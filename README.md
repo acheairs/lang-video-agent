@@ -1,16 +1,11 @@
-# AP Lang Video Worksheet Agent
-
-This project automatically completes AP English Language video-review worksheets.
-
-## Features
-
 * Extracts video titles from a worksheet PDF
-* Finds matching YouTube videos
-* Retrieves transcripts
-* Falls back to Whisper transcription when captions are unavailable
-* Uses OpenAI to generate worksheet responses
+* Finds matching YouTube videos with yt-dlp
+* Retrieves transcripts through the YouTube Transcript API
+* Falls back to OpenAI Whisper for audio transcription when transcripts are unavailable
+* Uses the OpenAI API to generate detailed worksheet responses
 * Produces a completed DOCX assignment
-* Generates a processing report
+* Integrates with the Google Drive API to automatically create and sync editable Google Docs
+* Generates a processing report with transcript availability, errors, and review flags
 
 ## Setup
 
